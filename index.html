@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>StickyMan</title>
+    <link rel="icon" href="data:," />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #2b2a27;
+        overflow: hidden;
+        touch-action: none;
+        user-select: none;
+        -webkit-user-select: none;
+        -webkit-touch-callout: none;
+      }
+      #game {
+        width: 100%;
+        height: 100%;
+      }
+      /* The arena is landscape; on a phone held upright it would be a thin strip. */
+      #rotate {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 10;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+        background: #f4efe1;
+        color: #24221e;
+        font: bold 22px 'Trebuchet MS', 'Segoe UI', sans-serif;
+        text-align: center;
+        padding: 0 24px;
+      }
+      #rotate .phone {
+        width: 44px;
+        height: 76px;
+        border: 5px solid #24221e;
+        border-radius: 10px;
+        animation: turn 2s ease-in-out infinite;
+      }
+      @keyframes turn {
+        0%,
+        30% {
+          transform: rotate(0deg);
+        }
+        60%,
+        100% {
+          transform: rotate(-90deg);
+        }
+      }
+      @media (orientation: portrait) and (pointer: coarse) {
+        #rotate {
+          display: flex;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="game"></div>
+    <div id="rotate">
+      <div class="phone"></div>
+      Turn your phone sideways to play
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
