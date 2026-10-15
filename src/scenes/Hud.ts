@@ -1,6 +1,7 @@
 import type Phaser from 'phaser';
 import { MAX_HP, SPECIAL_COOLDOWN, type SpecialName } from '../combat/Fighter';
 import { VIEW_WIDTH } from '../config';
+import { MAX_INK } from '../game/Ink';
 import { type Match, ROUNDS_TO_WIN } from '../game/Match';
 import { INK, type InkStyle, PAPER, PENCIL, WARNING_RED, toCss } from '../render/palette';
 import { drawShuriken } from '../render/shuriken';
@@ -24,6 +25,10 @@ const ICONS: readonly SpecialName[] = ['shuriken', 'smokeVanish'];
 const COMBO_MIN = 2;
 const COMBO_SHOW = 1.3;
 const COMBO_Y = ICON_Y + 34;
+/** The ink meter: beside the special icons, under the health bar. */
+const INK_X = 110;
+const INK_WIDTH = 190;
+const INK_HEIGHT = 9;
 
 export interface BannerOptions {
   size?: number;
@@ -49,6 +54,8 @@ export class Hud {
   private clockUrgent = false;
   private readonly comboTexts: Phaser.GameObjects.Text[];
   private readonly comboTimers = [0, 0];
+  /** Ink shown, easing toward the real level so refills and spending read as motion. */
+  private readonly shownInk = [MAX_INK, MAX_INK];
 
   constructor(
     private readonly scene: Phaser.Scene,
@@ -70,6 +77,12 @@ export class Hud {
       .text(VIEW_WIDTH / 2, BAR_Y + BAR_HEIGHT / 2, '', { fontFamily: FONT, fontSize: '30px', fontStyle: 'bold', color: toCss(INK) })
       .setOrigin(0.5);
     register(this.clock);
+    pens.forEach((pen, i) => {
+      const label = scene.add
+        .text(this.inkLeft(i) - 6, ICON_Y, 'INK', { fontFamily: FONT, fontSize: '12px', fontStyle: 'bold', color: toCss(pen.near) })
+        .setOrigin(1, 0.5);
+      register(label);
+    });
     this.comboTexts = pens.map((pen, i) => {
       const text = scene.add
         .text(i === 0 ? BAR_MARGIN : VIEW_WIDTH - BAR_MARGIN, COMBO_Y, '', {
@@ -146,6 +159,9 @@ export class Hud {
         const x = i === 0 ? BAR_MARGIN + offset : VIEW_WIDTH - BAR_MARGIN - offset;
         this.drawSpecialIcon(x, special, fighter.cooldowns[special] / SPECIAL_COOLDOWN[special], this.pens[i]);
       });
+      const level = match.ink.level(fighter);
+      this.shownInk[i] += (level - this.shownInk[i]) * Math.min(1, dt * 12);
+      this.drawInkMeter(i, this.shownInk[i] / MAX_INK, this.pens[i], match.ink.sketches.has(fighter));
       this.comboTimers[i] -= dt;
       const text = this.comboTexts[i];
       if (this.comboTimers[i] <= 0 && text.alpha > 0) text.setAlpha(Math.max(0, text.alpha - dt * 4));
@@ -203,12 +219,33 @@ export class Hud {
   }
 
   reset(): void {
+    this.shownInk.fill(MAX_INK);
     this.comboTimers.fill(0);
     for (const text of this.comboTexts) text.setAlpha(0);
     this.trail.fill(MAX_HP);
     this.hold.fill(0);
     this.lastHp.fill(MAX_HP);
     this.clearBanners();
+  }
+
+  /** Left edge of a fighter's ink meter. P2's mirrors P1's. */
+  private inkLeft(index: number): number {
+    return index === 0 ? BAR_MARGIN + INK_X : VIEW_WIDTH - BAR_MARGIN - INK_X - INK_WIDTH;
+  }
+
+  /** The ink meter, `full` 0..1; it glows while that player is drawing. */
+  private drawInkMeter(index: number, full: number, pen: InkStyle, drawing: boolean): void {
+    const g = this.g;
+    const x = this.inkLeft(index);
+    const y = ICON_Y - INK_HEIGHT / 2;
+    g.fillStyle(PAPER, 1);
+    g.fillRect(x, y, INK_WIDTH, INK_HEIGHT);
+    const w = INK_WIDTH * full;
+    g.fillStyle(pen.near, drawing ? 1 : 0.85);
+    // P1's drains toward the left like the health bar, P2's toward the right.
+    g.fillRect(index === 0 ? x : x + INK_WIDTH - w, y, w, INK_HEIGHT);
+    g.lineStyle(drawing ? 3 : 2, INK, 1);
+    g.strokeRect(x, y, INK_WIDTH, INK_HEIGHT);
   }
 
   /** A special's icon; a pale wedge covers the part still recharging (`left` 1 = just used). */

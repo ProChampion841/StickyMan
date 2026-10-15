@@ -29,6 +29,8 @@ export class Sfx {
   private ctx: AudioContext | null = null;
   private master: GainNode | null = null;
   private noise: AudioBuffer | null = null;
+  /** The looping pencil scratch while someone draws, and its volume. */
+  private scratch: { src: AudioBufferSourceNode; gain: GainNode } | null = null;
 
   /** Browsers only start audio after a user gesture, so call this from input handlers. */
   unlock(): void {
@@ -93,6 +95,62 @@ export class Sfx {
     this.noiseBurst('lowpass', 1800 * jitter(), 0.3, 0.4, 200);
     this.tone('sine', 300 * jitter(), 70, 0.15, 0.4);
     this.noiseBurst('lowpass', 1400, 0.25, 0.25, 200);
+  }
+
+  /** Pencil scratching on paper while a stroke is drawn; call with false when it ends. */
+  scribble(on: boolean): void {
+    if (!on) {
+      const scratch = this.scratch;
+      this.scratch = null;
+      if (scratch && this.ctx) {
+        scratch.gain.gain.setTargetAtTime(0.0001, this.ctx.currentTime, 0.03);
+        scratch.src.stop(this.ctx.currentTime + 0.15);
+      }
+      return;
+    }
+    const s = this.start();
+    if (!s || !this.noise || this.scratch) return;
+    const src = s.ctx.createBufferSource();
+    src.buffer = this.noise;
+    src.loop = true;
+    const filter = s.ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = 3200;
+    filter.Q.value = 1.4;
+    // A wobble in loudness, like strokes of the pencil.
+    const wobble = s.ctx.createOscillator();
+    wobble.frequency.value = 9;
+    const depth = s.ctx.createGain();
+    depth.gain.value = 0.05;
+    const gain = s.ctx.createGain();
+    gain.gain.value = 0.09;
+    wobble.connect(depth).connect(gain.gain);
+    src.connect(filter).connect(gain).connect(s.out);
+    src.start(s.t, Math.random() * 0.5);
+    wobble.start(s.t);
+    src.onended = () => wobble.stop();
+    this.scratch = { src, gain };
+  }
+
+  /** A drawing turning solid: a snap for a line, a hollow pop for a boulder. */
+  solidify(kind: 'line' | 'rock'): void {
+    if (kind === 'line') {
+      this.noiseBurst('bandpass', 1800 * jitter(), 0.09, 0.2, 600);
+      this.tone('triangle', 520 * jitter(), 260, 0.08, 0.18);
+    } else {
+      this.tone('sine', 220 * jitter(), 90, 0.18, 0.5);
+      this.noiseBurst('lowpass', 1200, 0.12, 0.25, 300);
+    }
+  }
+
+  /** Out of ink, or a stroke too small to become anything. */
+  fizzle(): void {
+    this.noiseBurst('highpass', 2500 * jitter(), 0.12, 0.08);
+  }
+
+  /** Rubber squeaking ink off the page. */
+  squeak(): void {
+    this.tone('sawtooth', 700 * jitter(), 1100, 0.07, 0.04);
   }
 
   ko(): void {

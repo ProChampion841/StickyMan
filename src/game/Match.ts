@@ -6,6 +6,7 @@ import { type Motion, Stickman } from '../stickman/Stickman';
 import { type Vec, clamp } from '../util/math';
 import type { Rng } from '../util/random';
 import { Eraser, type EraserEvent } from './Eraser';
+import { Ink, type InkEvent } from './Ink';
 import { ARENA_BOXES, ARENA_HEIGHT, ARENA_WIDTH, FLOOR_Y, SPAWNS } from './level';
 
 /** versus: two humans. vsBot: P1 human, P2 computer. demo: two computers, behind the title screen. */
@@ -15,6 +16,7 @@ export type MatchPhase = 'intro' | 'fight' | 'roundOver' | 'matchOver';
 export type MatchEvent =
   | CombatEvent
   | EraserEvent
+  | InkEvent
   | { type: 'motion'; fighter: Fighter; motion: Motion }
   | { type: 'shurikenStuck'; point: Vec }
   | { type: 'vanish'; fighter: Fighter; from: Vec; to: Vec }
@@ -53,6 +55,8 @@ const SHURIKEN_LIFE = 1.4;
 const SHURIKEN_STUCK_TIME = 0.8;
 /** How close (m) a star must pass to a body part's surface to hit it. */
 const SHURIKEN_REACH = 0.08;
+/** Stars move in hops of at most this (m) when checking what they hit. */
+const SHURIKEN_HOP = 0.05;
 /** The vanish reappears this far (m) behind the opponent. */
 const VANISH_BEHIND = 1;
 
@@ -67,6 +71,8 @@ export class Match {
   /** Per fighter: the computer player driving it, or null for a human. */
   readonly bots: (Bot | null)[];
   readonly eraser: Eraser;
+  /** Everyone's drawings and ink meters. */
+  readonly ink: Ink;
   readonly shurikens: Shuriken[] = [];
   readonly wins = [0, 0];
   phase: MatchPhase = 'intro';
@@ -92,6 +98,7 @@ export class Match {
     const isBot = (index: number) => options.mode === 'demo' || (options.mode === 'vsBot' && index === 1);
     this.bots = this.fighters.map((fighter, i) => (isBot(i) ? new Bot(fighter, profile, rng) : null));
     this.eraser = new Eraser(FLOOR_Y, ARENA_WIDTH, rng);
+    this.ink = new Ink(this.physics, this.fighters);
   }
 
   get isFinalRound(): boolean {
@@ -111,7 +118,7 @@ export class Match {
     this.fighters.forEach((fighter, i) => {
       const bot = this.bots[i];
       if (!fighting) fighter.idle();
-      else if (bot) bot.update(dt, this.fighters[1 - i], this);
+      else if (bot) bot.update(dt, this.fighters[1 - i], this, events);
     });
 
     const firstNew = events.length;
@@ -134,6 +141,13 @@ export class Match {
     this.physics.step();
     for (const fighter of this.fighters) fighter.postStep(this.fighters, events);
     this.stepShurikens(dt, events);
+    // Landing hits keeps the pen wet.
+    for (let i = firstNew; i < events.length; i++) {
+      const event = events[i];
+      if (event.type === 'hit') this.ink.rewardHit(event.attacker);
+    }
+    if (!fighting) for (const fighter of this.fighters) this.ink.cancel(fighter);
+    this.ink.step(dt, events, this.eraser);
     this.eraser.step(dt, this.fighters, events, fighting);
     this.rescueStrays();
 
@@ -172,38 +186,51 @@ export class Match {
     for (const star of this.shurikens) {
       star.life -= dt;
       if (star.stuck) continue;
-      star.x += star.vx * dt;
-      star.y += star.vy * dt;
       star.angle += Math.sign(star.vx || 1) * 25 * dt;
-      for (const fighter of this.fighters) {
-        if (fighter === star.owner) continue;
-        const hit = fighter.man.nearestPart(star, false);
-        if (hit.distance > SHURIKEN_REACH) continue;
-        star.life = 0;
-        events.push({
-          type: 'hit',
-          ...fighter.receive(star.owner, {
-            move: 'shuriken',
-            kind: 'special',
-            part: hit.part,
-            point: { x: star.x, y: star.y },
-            direction: star.vx >= 0 ? 1 : -1,
-            damage: TUNING.shurikenDamage,
-            knockback: { x: 1.2, y: -0.4 },
-            launches: false,
-            stun: 0.2,
-            tier: 'light',
-          }),
-        });
-        break;
-      }
-      if (star.life > 0 && this.inScenery(star)) {
-        star.stuck = true;
-        star.life = SHURIKEN_STUCK_TIME;
-        events.push({ type: 'shurikenStuck', point: { x: star.x, y: star.y } });
+      // Travel in short hops, so a fast star can't skip over a thin drawn line or a limb.
+      const hops = Math.max(1, Math.ceil((Math.hypot(star.vx, star.vy) * dt) / SHURIKEN_HOP));
+      for (let i = 0; i < hops && star.life > 0 && !star.stuck; i++) {
+        star.x += (star.vx * dt) / hops;
+        star.y += (star.vy * dt) / hops;
+        this.shurikenContact(star, events);
       }
     }
     for (let i = this.shurikens.length - 1; i >= 0; i--) if (this.shurikens[i].life <= 0) this.shurikens.splice(i, 1);
+  }
+
+  /** A star hits a fighter, bites into a wall or drawn line, or glances off a boulder. */
+  private shurikenContact(star: Shuriken, events: MatchEvent[]): void {
+    for (const fighter of this.fighters) {
+      if (fighter === star.owner) continue;
+      const hit = fighter.man.nearestPart(star, false);
+      if (hit.distance > SHURIKEN_REACH) continue;
+      star.life = 0;
+      events.push({
+        type: 'hit',
+        ...fighter.receive(star.owner, {
+          move: 'shuriken',
+          kind: 'special',
+          part: hit.part,
+          point: { x: star.x, y: star.y },
+          direction: star.vx >= 0 ? 1 : -1,
+          damage: TUNING.shurikenDamage,
+          knockback: { x: 1.2, y: -0.4 },
+          launches: false,
+          stun: 0.2,
+          tier: 'light',
+        }),
+      });
+      return;
+    }
+    const ink = this.ink.blocks(star);
+    if (ink === 'rock') {
+      star.life = 0;
+      events.push({ type: 'shurikenStuck', point: { x: star.x, y: star.y } });
+    } else if (ink === 'line' || this.inScenery(star)) {
+      star.stuck = true;
+      star.life = SHURIKEN_STUCK_TIME;
+      events.push({ type: 'shurikenStuck', point: { x: star.x, y: star.y } });
+    }
   }
 
   private inScenery(p: Vec): boolean {
@@ -261,6 +288,7 @@ export class Match {
       fighter.man.reset();
     }
     this.eraser.reset();
+    this.ink.reset();
     this.shurikens.length = 0;
     this.setPhase('intro', events);
     events.push({ type: 'roundStart', round: this.round, final: this.isFinalRound });

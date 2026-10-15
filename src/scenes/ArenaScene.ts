@@ -12,17 +12,19 @@ import { Grabber } from '../physics/Grabber';
 import { FIXED_DT } from '../physics/PhysicsWorld';
 import type { RigidBody } from '../physics/rapier';
 import { Afterimages } from '../render/Afterimages';
+import { Headbands } from '../render/Headbands';
 import { ComicFx, hitWord } from '../render/ComicFx';
 import { InkFx } from '../render/InkFx';
 import { TouchPadView } from '../render/TouchPadView';
 import { Trails } from '../render/Trails';
 import { drawEraser } from '../render/drawEraser';
+import { drawInk } from '../render/drawInk';
 import { type Extremity, drawDizzyStars, drawStickman } from '../render/drawStickman';
 import { BLUE_PEN, ERASER_PINK, FLASH_PEN, INK, type InkStyle, PAPER, PENCIL, RED_PEN, toCss } from '../render/palette';
 import { drawLevel, drawPaper } from '../render/paper';
 import { drawShuriken } from '../render/shuriken';
 import type { Motion } from '../stickman/Stickman';
-import type { Vec } from '../util/math';
+import { type Vec, clamp } from '../util/math';
 import { Hud } from './Hud';
 
 /** Caps catch-up steps after a stall so a slow frame can't snowball. */
@@ -49,6 +51,19 @@ const TIER_STRENGTH: Record<HitTier, number> = { light: 0.35, medium: 0.55, heav
 /** Camera zoom-punch toward heavy hits and knockouts (fraction of normal zoom). */
 const ZOOM_HEAVY = 0.06;
 const ZOOM_KO = 0.12;
+/**
+ * The fight camera keeps the floor at the bottom of the screen, follows the fighters and
+ * zooms in when they're close, up to this much. Pixels of room kept around them.
+ */
+const CAMERA_MAX_ZOOM = 1.45;
+const CAMERA_SIDE_ROOM = 230;
+const CAMERA_TOP_ROOM = 150;
+/** How quickly (per second) the camera catches up with its zoom and its target. */
+const CAMERA_ZOOM_RATE = 2.5;
+const CAMERA_PAN_RATE = 6;
+/** A zoom-punch leans the view this far toward the hit. */
+const PUNCH_LEAN = 0.35;
+const PUNCH_RELEASE = 0.3;
 /** Which fist or foot ends each striking limb. */
 const LIMB_END: Partial<Record<string, Extremity>> = {
   lowerArmL: 'handL',
@@ -83,6 +98,17 @@ const BLUR_MOVES: ReadonlySet<MoveName> = new Set<MoveName>([
  */
 const COMBO_GAP = 2;
 const SHURIKEN_RADIUS = 11;
+/** Shadows under the fighters: size (px), and the height (m) at which they fade out. */
+const SHADOW_WIDTH = 70;
+const SHADOW_HEIGHT = 12;
+const SHADOW_FADE = 3;
+/** While a player draws, the fight runs at this speed: time to draw mid-fight. */
+const INK_TIME_SCALE = 0.3;
+/** A stroke finishes by itself after this long (real seconds), so drawing can't stall the fight. */
+const INK_TIME_MAX = 1.6;
+const INK_TINT = 0x24459c;
+const INK_TINT_ALPHA = 0.07;
+const CRUSH_WORDS = ['BONK!', 'THUD!', 'CRUNCH!'];
 /** A star stuck in the scenery fades over its last this-many seconds. */
 const SHURIKEN_FADE = 0.3;
 const PENS: readonly InkStyle[] = [BLUE_PEN, RED_PEN];
@@ -122,6 +148,9 @@ type HeldKeys = Record<'left' | 'right' | 'jump' | 'down', Phaser.Input.Keyboard
 
 /** The move list on the title screen: section headings (input '') and input / move rows. */
 const MOVE_LIST: readonly (readonly [input: string, move: string])[] = [
+  ['', 'Draw to fight: drag the mouse or a finger across the page'],
+  ['Draw a line', 'A solid wall or platform: stop stars, climb, box them in'],
+  ['Draw a loop', 'A boulder that drops on whoever is under it (you too!)'],
   ['', 'Ground chain: up to 3 hits, punches and kicks in any mix'],
   ['Punch, Punch, Punch', 'Palm Strike → Elbow Smash → Rising Dragon'],
   ['Kick, Kick, Kick', 'Snap Kick → Spin Kick → Tornado Kick'],
@@ -176,10 +205,19 @@ export class ArenaScene extends Phaser.Scene {
   private comic!: ComicFx;
   private readonly trails = new Trails(2);
   private readonly afterimages = new Afterimages(2);
+  private readonly headbands = new Headbands();
+  /** Pointers drawing right now: whose ink each one uses, and when it started (ms). */
+  private readonly drawingPointers = new Map<number, { fighter: Fighter; since: number }>();
+  /** A faint tint over the fight while someone draws and time slows. */
+  private inkTint!: Phaser.GameObjects.Rectangle;
   private readonly doubleTap = new DoubleTap();
   /** Renders the HUD and controls, so they stay still while the main camera shakes and zooms. */
   private uiCamera!: Phaser.Cameras.Scene2D.Camera;
-  private zoomReturn: Phaser.Time.TimerEvent | null = null;
+  /** Where the follow camera is: center x (pixels) and zoom, eased toward the action. */
+  private camX = VIEW_WIDTH / 2;
+  private camZoom = 1;
+  /** The zoom-punch on a heavy hit: extra zoom toward a point, held, then released. */
+  private punch: { at: Vec; amount: number; hold: number; release: number } | null = null;
   private hud!: Hud;
   private title!: Phaser.GameObjects.Container;
   private moveList!: Phaser.GameObjects.Container;
@@ -241,6 +279,8 @@ export class ArenaScene extends Phaser.Scene {
     for (const object of [paper, stainLayer, level, this.hazardInk, this.ink, fxLayer, this.debugInk]) world(object);
     this.comic = new ComicFx(this, world, COMIC_DEPTH);
 
+    this.inkTint = this.add.rectangle(VIEW_WIDTH / 2, VIEW_HEIGHT / 2, VIEW_WIDTH, VIEW_HEIGHT, INK_TINT, 0);
+    ui(this.inkTint);
     this.hud = new Hud(this, PENS, ui);
     this.help = [0, 1, 2].map((i) => {
       const text = this.add.text(0, FLOOR_Y * PPM + 12 + (i === 2 ? 26 : 0), '', TEXT_STYLE);
@@ -296,13 +336,19 @@ export class ArenaScene extends Phaser.Scene {
     const dt = Math.min(deltaMs / 1000, MAX_FRAME);
     if (this.mode !== 'demo') this.readHeldKeys();
 
+    for (const [id, drawing] of this.drawingPointers) {
+      if (!this.match.ink.sketches.has(drawing.fighter) || time - drawing.since > INK_TIME_MAX * 1000) this.endDrawing(id);
+    }
+    const inkTime = this.drawingPointers.size > 0;
+    if ((this.inkTint.fillAlpha > 0) !== inkTime) this.inkTint.setFillStyle(INK_TINT, inkTime ? INK_TINT_ALPHA : 0);
+
     let timeScale = 1;
     if (this.hitstop > 0) {
       this.hitstop -= dt;
       this.accumulator = 0;
     } else {
       this.slowMo = Math.max(0, this.slowMo - dt);
-      timeScale = this.slowMo > 0 ? TUNING.slowMoScale : 1;
+      timeScale = Math.min(this.slowMo > 0 ? TUNING.slowMoScale : 1, inkTime ? INK_TIME_SCALE : 1);
       this.accumulator = Math.min(this.accumulator + dt * timeScale, FIXED_DT * MAX_STEPS_PER_FRAME);
       // A hit inside this loop starts a hitstop, which freezes the remaining steps immediately.
       while (this.accumulator >= FIXED_DT && this.hitstop <= 0) {
@@ -324,6 +370,7 @@ export class ArenaScene extends Phaser.Scene {
     }
 
     this.rubOutStains();
+    this.updateCamera(dt);
     this.fx.update(dt * timeScale);
     this.afterimages.update(this.hitstop > 0 ? 0 : dt * timeScale);
     this.hud.update(dt, this.match);
@@ -354,9 +401,13 @@ export class ArenaScene extends Phaser.Scene {
     this.comic.clear();
     this.trails.clear();
     this.afterimages.clear();
+    this.headbands.clear();
     this.doubleTap.clear();
-    this.zoomReturn?.remove();
-    this.zoomReturn = null;
+    this.drawingPointers.clear();
+    this.sfx.scribble(false);
+    this.punch = null;
+    this.camX = VIEW_WIDTH / 2;
+    this.camZoom = 1;
     this.cameras.main.resetFX();
     this.cameras.main.setZoom(1).setScroll(0, 0);
     this.hud.reset();
@@ -507,6 +558,33 @@ export class ArenaScene extends Phaser.Scene {
       case 'special':
         if (event.special === 'shuriken') this.sfx.throwStar();
         break;
+      case 'inkDrawn':
+        this.sfx.solidify(event.kind);
+        break;
+      case 'inkFizzle':
+        this.sfx.fizzle();
+        this.fx.puff({ x: event.point.x * PPM, y: event.point.y * PPM }, 1, 3);
+        break;
+      case 'inkCrush': {
+        const victimX = event.victim.man.centerOfMass().x;
+        this.impact({
+          victim: event.victim,
+          point: event.point,
+          direction: event.point.x <= victimX ? 1 : -1,
+          tier: 'heavy',
+          strength: event.ko ? 1 : 0.7,
+          freeze: event.ko ? T.koHitstop : T.hitstopMax,
+          ko: event.ko,
+          head: false,
+          word: event.ko ? 'KABOOM!' : CRUSH_WORDS[Math.floor(Math.random() * CRUSH_WORDS.length)],
+        });
+        if (!demo && event.owner !== event.victim) this.countCombo(event.owner, event.victim);
+        break;
+      }
+      case 'inkErased':
+        this.sfx.squeak();
+        this.fx.crumbs({ x: event.point.x * PPM, y: event.point.y * PPM }, this.match.eraser.dir, PENCIL);
+        break;
       case 'shurikenStuck':
         this.sfx.tink();
         this.fx.burst({ x: event.point.x * PPM, y: event.point.y * PPM }, 0);
@@ -546,10 +624,19 @@ export class ArenaScene extends Phaser.Scene {
       case 'roundStart':
         if (!demo) this.hud.banner(event.final ? 'Final Round' : `Round ${event.round}`, { size: 72, hold: 0.7 });
         break;
-      case 'fight':
+      case 'fight': {
         this.sfx.bell();
-        if (!demo) this.hud.banner('FIGHT!', { size: 96, hold: 0.35 });
+        if (demo) break;
+        // The first fight of a match reminds everyone of the pen.
+        const first = this.match.round === 1;
+        const how = this.touchMode ? 'Drag a finger' : 'Drag the mouse';
+        this.hud.banner('FIGHT!', {
+          size: 96,
+          hold: first ? 1.8 : 0.35,
+          sub: first ? `${how} to draw: a line makes a wall, a loop drops a boulder` : undefined,
+        });
         break;
+      }
       case 'roundOver':
         if (demo) break;
         this.hud.banner(event.reason === 'ko' ? 'K.O.!' : 'TIME!', { size: 96, hold: 0.9 });
@@ -598,15 +685,54 @@ export class ArenaScene extends Phaser.Scene {
   /** Snaps the fight camera in toward `at` (pixels), then eases back out after `holdMs`. */
   private zoomPunch(at: Vec, amount: number, holdMs: number): void {
     if (amount <= 0) return;
+    this.punch = { at, amount, hold: holdMs / 1000, release: PUNCH_RELEASE };
+  }
+
+  /**
+   * Frames the fight like a fighting game: the floor stays at the bottom of the screen, the
+   * view follows the fighters and zooms in when they're close, and pulls back when someone
+   * climbs high or the eraser is coming. A zoom-punch rides on top.
+   */
+  private updateCamera(dt: number): void {
+    const xs: number[] = [];
+    let top = Infinity;
+    for (const { man } of this.match.fighters) {
+      const head = man.parts.head.translation();
+      xs.push(man.centerOfMass().x * PPM);
+      top = Math.min(top, head.y * PPM);
+    }
+    const eraser = this.match.eraser;
+    if (eraser.phase === 'warning') xs.push(eraser.dir > 0 ? 0 : VIEW_WIDTH);
+    if (eraser.phase === 'sweeping') xs.push(eraser.x * PPM);
+    const left = Math.min(...xs);
+    const right = Math.max(...xs);
+    const fitWidth = VIEW_WIDTH / (right - left + CAMERA_SIDE_ROOM * 2);
+    const fitHeight = VIEW_HEIGHT / (VIEW_HEIGHT - (top - CAMERA_TOP_ROOM));
+    const zoom = clamp(Math.min(fitWidth, fitHeight), 1, CAMERA_MAX_ZOOM);
+    // Holds still while someone draws, so the page doesn't slide under the pen.
+    if (this.drawingPointers.size === 0) {
+      this.camZoom += (zoom - this.camZoom) * Math.min(1, dt * CAMERA_ZOOM_RATE);
+      this.camX += ((left + right) / 2 - this.camX) * Math.min(1, dt * CAMERA_PAN_RATE);
+    }
+
+    let extra = 0;
+    let x = this.camX;
+    let y = VIEW_HEIGHT - VIEW_HEIGHT / this.camZoom / 2;
+    const punch = this.punch;
+    if (punch) {
+      // Hold during the hit's freeze, then ease back out.
+      if (punch.hold > 0) punch.hold -= dt;
+      else punch.release -= dt;
+      const strength = punch.hold > 0 ? 1 : Math.max(0, punch.release / PUNCH_RELEASE);
+      extra = punch.amount * strength;
+      x += (punch.at.x - x) * PUNCH_LEAN * strength;
+      y += (punch.at.y - y) * PUNCH_LEAN * strength;
+      if (punch.release <= 0) this.punch = null;
+    }
     const camera = this.cameras.main;
-    camera.zoomTo(1 + amount, 70, 'Quad.easeOut', true);
-    camera.pan(at.x, at.y, 70, 'Quad.easeOut', true);
-    this.zoomReturn?.remove();
-    this.zoomReturn = this.time.delayedCall(holdMs, () => {
-      camera.zoomTo(1, 300, 'Quad.easeInOut', true);
-      camera.pan(VIEW_WIDTH / 2, VIEW_HEIGHT / 2, 300, 'Quad.easeInOut', true);
-      this.zoomReturn = null;
-    });
+    camera.setZoom(this.camZoom + extra);
+    // The camera's bounds keep the view inside the page.
+    camera.centerOn(x, y);
   }
 
   /** Dust off the pushing foot for moves that drive off the floor; speed lines for lunges, leaps and dives. */
@@ -695,7 +821,7 @@ export class ArenaScene extends Phaser.Scene {
       })
       .setOrigin(0.5);
     const tagline = this.add
-      .text(cx, 225, 'a sketchbook ninja brawler', { ...TEXT_STYLE, fontSize: '22px', fontStyle: 'italic' })
+      .text(cx, 225, 'draw to fight  ·  a sketchbook ninja brawler', { ...TEXT_STYLE, fontSize: '22px', fontStyle: 'italic' })
       .setOrigin(0.5);
     const option = (y: number, label: string, action: () => void) =>
       this.add
@@ -732,25 +858,25 @@ export class ArenaScene extends Phaser.Scene {
         .text(cx, top + 34, 'Ninja Moves', { ...TEXT_STYLE, fontSize: '38px', fontStyle: 'bold italic', color: toCss(INK) })
         .setOrigin(0.5),
     );
-    let y = top + 70;
+    let y = top + 64;
     for (const [input, move] of MOVE_LIST) {
       if (!input) {
-        y += 8;
+        y += 6;
         parts.push(
           this.add
-            .text(cx, y, move, { ...TEXT_STYLE, fontSize: '18px', fontStyle: 'bold', color: toCss(RED_PEN.near) })
+            .text(cx, y, move, { ...TEXT_STYLE, fontSize: '17px', fontStyle: 'bold', color: toCss(RED_PEN.near) })
             .setOrigin(0.5, 0),
         );
-        y += 26;
+        y += 23;
         continue;
       }
       parts.push(
         this.add
-          .text(cx - 16, y, input, { ...TEXT_STYLE, fontSize: '17px', fontStyle: 'bold', color: toCss(BLUE_PEN.near) })
+          .text(cx - 16, y, input, { ...TEXT_STYLE, fontSize: '16px', fontStyle: 'bold', color: toCss(BLUE_PEN.near) })
           .setOrigin(1, 0),
-        this.add.text(cx + 4, y, move, { ...TEXT_STYLE, fontSize: '17px' }),
+        this.add.text(cx + 4, y, move, { ...TEXT_STYLE, fontSize: '16px' }),
       );
-      y += 22;
+      y += 20;
     }
     parts.push(
       this.add
@@ -773,16 +899,20 @@ export class ArenaScene extends Phaser.Scene {
       vsBot: [
         'Move A/D or ←/→    Jump W or ↑    Crouch S or ↓    Punch F or /    Kick G or .    Special H or ,',
         '',
-        'Double-tap a direction to dash    Jump again in the air    Jump the eraser!    R restart    Esc menu',
+        'Drag the mouse to draw: a line is a wall, a loop is a boulder    Double-tap to dash    R restart    Esc menu',
       ],
       versus: [
         'P1   A/D move   W jump   S crouch   F punch   G kick   H special',
         'P2   ←/→ move   ↑ jump   ↓ crouch   / punch   . kick   , special',
-        'Double-tap a direction to dash    Jump the eraser!    R restart    Esc menu',
+        'Draw with the mouse on your own half    Double-tap to dash    R restart    Esc menu',
       ],
     };
     // With on-screen buttons, the floor between the two clusters only has room for a reminder.
-    const touchLines: [string, string, string] = ['', '', this.mode === 'demo' ? keyboardLines.demo[2] : 'Jump the eraser!'];
+    const touchLines: [string, string, string] = [
+      '',
+      '',
+      this.mode === 'demo' ? keyboardLines.demo[2] : 'Draw with a finger: a line is a wall, a loop is a boulder',
+    ];
     const [l, r, c] = this.touchMode ? touchLines : keyboardLines[this.mode];
     const single = this.mode === 'vsBot';
     left.setText(l).setColor(toCss(BLUE_PEN.near)).setOrigin(single ? 0.5 : 0, 0).setX(single ? VIEW_WIDTH / 2 : 110);
@@ -811,9 +941,12 @@ export class ArenaScene extends Phaser.Scene {
       if (playing && this.touchMode) {
         const button = this.pad.press(p.id, p.x, p.y);
         if (button) return this.padPress(button);
-        if (this.match.phase === 'matchOver') return this.startMatch(this.mode);
       }
-      if (playing && p.wasTouch) return;
+      if (playing) {
+        if (this.match.phase === 'matchOver') return this.startMatch(this.mode);
+        // Anywhere else on the page, a finger or the mouse is a pen.
+        return this.startDrawing(p.id, p.x, toMeters(p));
+      }
       const point = toMeters(p);
       let best: { body: RigidBody; distance: number } | null = null;
       for (const { man } of this.match.fighters) {
@@ -827,10 +960,13 @@ export class ArenaScene extends Phaser.Scene {
     });
     this.input.on('pointermove', (p: Phaser.Input.Pointer) => {
       this.pad.slide(p.id, p.x, p.y);
+      const drawing = this.drawingPointers.get(p.id);
+      if (drawing) this.match.ink.extend(drawing.fighter, toMeters(p));
       if (p.id === this.grabPointer) this.grabber.moveTo(toMeters(p));
     });
     const lift = (p: Phaser.Input.Pointer) => {
       this.pad.release(p.id);
+      this.endDrawing(p.id);
       if (p.id === this.grabPointer) {
         this.grabber.release();
         this.grabPointer = null;
@@ -838,6 +974,34 @@ export class ArenaScene extends Phaser.Scene {
     };
     this.input.on('pointerup', lift);
     this.input.on('pointerupoutside', lift);
+  }
+
+  /**
+   * A finger or the mouse touched the page mid-fight: start a stroke with that player's ink.
+   * Against the computer every stroke is P1's; two players each draw on their own half.
+   */
+  private startDrawing(pointerId: number, screenX: number, point: Vec): void {
+    if (this.match.phase !== 'fight') return;
+    const index = this.mode === 'vsBot' || screenX < VIEW_WIDTH / 2 ? 0 : 1;
+    const fighter = this.match.fighters[index];
+    if (this.match.bots[index] || this.match.ink.sketches.has(fighter)) return;
+    if (!this.match.ink.begin(fighter, point)) {
+      this.sfx.fizzle();
+      return;
+    }
+    this.drawingPointers.set(pointerId, { fighter, since: this.time.now });
+    this.sfx.scribble(true);
+  }
+
+  /** The pen lifted (or ran out of time): the stroke turns solid, or fizzles. */
+  private endDrawing(pointerId: number): void {
+    const drawing = this.drawingPointers.get(pointerId);
+    if (!drawing) return;
+    this.drawingPointers.delete(pointerId);
+    const events: MatchEvent[] = [];
+    this.match.ink.finish(drawing.fighter, events);
+    for (const event of events) this.handle(event);
+    if (this.drawingPointers.size === 0) this.sfx.scribble(false);
   }
 
   private draw(alpha: number, dt: number): void {
@@ -865,6 +1029,16 @@ export class ArenaScene extends Phaser.Scene {
         fighter.man.dashing || fighter.man.flipping || (move?.phase === 'strike' && BLUR_MOVES.has(move.move));
       this.afterimages.track(i, s, fighter.man.facing, fast && !fighter.knockedOut, frameDt);
     });
+    // Soft shadows on whatever is below each fighter, shrinking as they rise.
+    for (const { man } of this.match.fighters) {
+      const pelvis = man.pelvis();
+      const ground = man.groundDistance !== null ? pelvis.y + man.groundDistance : FLOOR_Y;
+      const fade = clamp(1 - Math.max(0, ground - pelvis.y - TUNING.hoverHeight) / SHADOW_FADE, 0, 1);
+      if (fade <= 0) continue;
+      g.fillStyle(INK, 0.13 * fade);
+      g.fillEllipse(pelvis.x * PPM, ground * PPM, SHADOW_WIDTH * (0.6 + 0.4 * fade), SHADOW_HEIGHT);
+    }
+    drawInk(g, this.match.ink, (owner) => PENS[this.match.fighters.indexOf(owner)] ?? FLASH_PEN, boilSeed, TUNING.lineBoil);
     this.afterimages.draw(g, PENS);
     this.trails.draw(g, PENS.map((pen) => pen.near));
 
@@ -879,10 +1053,14 @@ export class ArenaScene extends Phaser.Scene {
       }
       const man = fighter.man;
       const face = fighter.knockedOut ? 'ko' : man.stunned ? 'hurt' : 'normal';
+      const skull = skeletons[i].head;
+      this.headbands.update(i, { x: skull.x * PPM, y: skull.y * PPM }, man.facing, frameDt);
+      this.headbands.draw(g, i, ink.far, offset);
       const head = drawStickman(g, skeletons[i], man.facing, ink, boilSeed + i * 1000, TUNING.lineBoil, {
         offset,
         face,
         striker: strikers[i],
+        band: ink.far,
       });
       // Seeing stars after a big hit, and while knocked out.
       if (fighter.knockedOut || (man.stunned && man.stunInfo.total >= 0.5)) drawDizzyStars(g, head, seconds);

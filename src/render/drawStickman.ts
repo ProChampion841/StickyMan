@@ -5,7 +5,7 @@ import { DIM } from '../stickman/skeleton';
 import type { Vec } from '../util/math';
 import { INK, type InkStyle, PAPER } from './palette';
 
-const LIMB_WIDTH = 0.13 * PPM;
+const LIMB_WIDTH = 0.16 * PPM;
 const EYE_RADIUS = 0.04 * PPM;
 const HEAD_RADIUS = DIM.headRadius * PPM;
 /** A striking fist or foot is drawn as a ball this much wider than the limb, so it reads at speed. */
@@ -23,6 +23,8 @@ export interface StickmanLook {
   striker?: Extremity | null;
   /** Opacity, below 1 for afterimages. */
   alpha?: number;
+  /** Color of the ninja headband across the forehead; none if omitted. */
+  band?: number;
 }
 
 /** Cheap deterministic noise in [-1, 1]. */
@@ -65,6 +67,16 @@ export function drawStickman(
   const head = px(s.head);
   g.fillStyle(ink.near, alpha);
   g.fillCircle(head.x, head.y, HEAD_RADIUS);
+  if (look.band !== undefined) {
+    // A band around the forehead, tilted a touch down toward the face.
+    g.lineStyle(HEAD_RADIUS * 0.34, look.band, alpha);
+    g.lineBetween(
+      head.x - facing * HEAD_RADIUS * 0.9,
+      head.y - HEAD_RADIUS * 0.58,
+      head.x + facing * HEAD_RADIUS * 0.9,
+      head.y - HEAD_RADIUS * 0.46,
+    );
+  }
   drawFace(g, head, facing, look.face ?? 'normal', alpha);
 
   polyline(g, [pelvis, px(j.kneeR), ends.footR], ink.near, alpha);

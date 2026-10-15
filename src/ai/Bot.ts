@@ -1,7 +1,18 @@
 import type { Fighter } from '../combat/Fighter';
 import { TUNING } from '../config';
 import type { Eraser } from '../game/Eraser';
+import type { Ink, InkEvent } from '../game/Ink';
+import type { Shuriken } from '../game/Match';
+import type { EventSink } from '../util/events';
+import type { Vec } from '../util/math';
 import type { Rng } from '../util/random';
+
+/** What the computer player can see of the world besides the two fighters. */
+export interface BotWorld {
+  eraser: Eraser;
+  ink: Ink;
+  shurikens: readonly Shuriken[];
+}
 
 export interface BotProfile {
   /** Average seconds between decisions; lower reacts faster. */
@@ -16,18 +27,20 @@ export interface BotProfile {
   rangedChance: number;
   /** Chance to chase a launched opponent into the air. */
   airChase: number;
+  /** Chance per decision to draw: a boulder over a distant opponent, a wall against a star. */
+  inkChance: number;
 }
 
 export type BotLevel = 'easy' | 'normal' | 'hard';
 
 export const BOT_PROFILES: Record<BotLevel, BotProfile> = {
-  easy: { reaction: 0.32, aggression: 0.45, caution: 0.1, hazardSkill: 0.55, rangedChance: 0.15, airChase: 0.2 },
-  normal: { reaction: 0.2, aggression: 0.7, caution: 0.3, hazardSkill: 0.85, rangedChance: 0.3, airChase: 0.5 },
-  hard: { reaction: 0.11, aggression: 0.85, caution: 0.5, hazardSkill: 0.97, rangedChance: 0.4, airChase: 0.85 },
+  easy: { reaction: 0.32, aggression: 0.45, caution: 0.1, hazardSkill: 0.55, rangedChance: 0.15, airChase: 0.2, inkChance: 0.06 },
+  normal: { reaction: 0.2, aggression: 0.7, caution: 0.3, hazardSkill: 0.85, rangedChance: 0.3, airChase: 0.5, inkChance: 0.12 },
+  hard: { reaction: 0.11, aggression: 0.85, caution: 0.5, hazardSkill: 0.97, rangedChance: 0.4, airChase: 0.85, inkChance: 0.2 },
 };
 
-/** One step of a plan: a button (d = with down held), a jump, or a dash toward the opponent. */
-type Action = 'P' | 'K' | 'dP' | 'dK' | 'S' | 'dS' | 'jump' | 'dash';
+/** One step of a plan: a button (d = with down held), a jump, a dash toward the opponent, or one out of danger. */
+type Action = 'P' | 'K' | 'dP' | 'dK' | 'S' | 'dS' | 'jump' | 'dash' | 'dashAway';
 
 /** Ground strings it throws at close range; every one is a real combo route. */
 const STRINGS: readonly (readonly Action[])[] = [
@@ -58,6 +71,20 @@ const AFTER_JUMP = 0.2;
 /** Follows an opponent this much higher (m), e.g. up on a platform. */
 const CLIMB_HEIGHT = 1.2;
 const CLIMB_RANGE = 2.5;
+/** A boulder is drawn this radius (m), this far above the opponent's head, a few points per step. */
+const ROCK_RADIUS = 0.35;
+const ROCK_HEIGHT = 2;
+const ROCK_POINTS = 28;
+const ROCK_INK = 45;
+/** Leads a running opponent by this many seconds of their speed. */
+const ROCK_LEAD = 0.35;
+/** Shield walls: drawn this far (m) in front, this tall, against stars within this range. */
+const WALL_GAP = 0.75;
+const WALL_HEIGHT = 1.7;
+const WALL_RANGE = 4;
+const WALL_INK = 25;
+/** Points of a drawing it adds per step: a visible stroke the opponent can react to. */
+const DRAW_SPEED = 2;
 /**
  * Starts no new attacks once a sweep it means to dodge is this close (s): a fighter stunned
  * mid-combo, its own or the opponent's, can't jump.
@@ -83,6 +110,11 @@ export class Bot {
   private lastSweep = -1;
   private dodgeThisSweep = true;
   private toward: 1 | -1 = 1;
+  /** Direction of the escape for a 'dashAway'. */
+  private awayDir: 1 | -1 = 1;
+  /** A drawing in progress: the points still to draw, in order. */
+  private drawing: Vec[] = [];
+  private readonly shielded = new WeakSet<Shuriken>();
 
   constructor(
     readonly me: Fighter,
@@ -90,21 +122,23 @@ export class Bot {
     private readonly rng: Rng,
   ) {}
 
-  /** Sets this step's inputs. Call before Fighter.preStep. */
-  update(dt: number, opponent: Fighter, world: { eraser: Eraser }): void {
+  /** Sets this step's inputs and draws; finished drawings report to `events`. Call before Fighter.preStep. */
+  update(dt: number, opponent: Fighter, world: BotWorld, events: EventSink<InkEvent> = []): void {
     this.retreatTimer -= dt;
     this.jumpHold -= dt;
     this.downHold -= dt;
     this.waitTimer -= dt;
     this.toward = opponent.man.centerOfMass().x >= this.me.man.centerOfMass().x ? 1 : -1;
     const bracing = this.dodge(world.eraser);
+    this.draw(world.ink, events);
+    this.shield(opponent, world);
     this.runPlan();
 
     this.thinkTimer -= dt;
     if (this.thinkTimer <= 0) {
       this.thinkTimer = this.profile.reaction * (0.6 + 0.8 * this.rng());
       if (bracing) this.move = 0;
-      else if (this.plan.length === 0) this.decide(opponent);
+      else if (this.plan.length === 0 && !this.dodgeRock(opponent, world.ink)) this.decide(opponent, world.ink);
     }
 
     const input = this.me.man.input;
@@ -121,8 +155,8 @@ export class Bot {
     if (action === 'jump') {
       this.jump();
       this.waitTimer = AFTER_JUMP;
-    } else if (action === 'dash') {
-      me.queueDash(this.toward);
+    } else if (action === 'dash' || action === 'dashAway') {
+      me.queueDash(action === 'dash' ? this.toward : this.awayDir);
       this.waitTimer = 0.05;
     } else {
       if (me.attacking) return;
@@ -135,7 +169,7 @@ export class Bot {
     this.plan.shift();
   }
 
-  private decide(opponent: Fighter): void {
+  private decide(opponent: Fighter, ink: Ink): void {
     const man = this.me.man;
     const me = man.centerOfMass();
     const them = opponent.man.centerOfMass();
@@ -181,6 +215,9 @@ export class Bot {
       return;
     }
 
+    // From range, draw a boulder over their head.
+    if (distance > MID_RANGE && rng() < p.inkChance && this.startRock(opponent, ink)) return;
+
     if (distance > FAR_RANGE) {
       if (facing && this.me.cooldowns.shuriken === 0 && rng() < p.rangedChance) {
         this.move = 0;
@@ -208,6 +245,69 @@ export class Bot {
     this.move = facing ? 0 : toward * 0.2;
     if (!facing || this.me.attacking) return;
     if (rng() < p.aggression) this.plan = [...STRINGS[Math.floor(rng() * STRINGS.length)]];
+  }
+
+  /** Starts drawing a circle above the opponent, leading them if they run. */
+  private startRock(opponent: Fighter, ink: Ink): boolean {
+    if (this.drawing.length > 0 || ink.level(this.me) < ROCK_INK || !opponent.man.grounded) return false;
+    const head = opponent.man.parts.head.translation();
+    const lead = opponent.man.centerOfMassVelocity().x * ROCK_LEAD;
+    const center = { x: head.x + lead, y: head.y - ROCK_HEIGHT };
+    if (center.y < 0.6) return false;
+    this.drawing = Array.from({ length: ROCK_POINTS + 1 }, (_, i) => {
+      // Drawn from the top, clockwise on screen, like a hand would.
+      const angle = -Math.PI / 2 + (i / ROCK_POINTS) * Math.PI * 2;
+      return { x: center.x + Math.cos(angle) * ROCK_RADIUS, y: center.y + Math.sin(angle) * ROCK_RADIUS };
+    });
+    return true;
+  }
+
+  /** A star from the opponent is on its way: draw a wall in front to catch it. */
+  private shield(opponent: Fighter, world: BotWorld): void {
+    if (this.drawing.length > 0 || world.ink.level(this.me) < WALL_INK) return;
+    const me = this.me.man.centerOfMass();
+    for (const star of world.shurikens) {
+      if (star.owner !== opponent || star.stuck || this.shielded.has(star)) continue;
+      const ahead = (me.x - star.x) * Math.sign(star.vx);
+      if (ahead <= WALL_GAP + 0.3 || ahead > WALL_RANGE) continue;
+      this.shielded.add(star);
+      if (this.rng() >= this.profile.inkChance * 3) continue;
+      const x = me.x - Math.sign(star.vx) * WALL_GAP;
+      const floor = this.me.man.pelvis().y + TUNING.hoverHeight;
+      this.drawing = Array.from({ length: 12 }, (_, i) => ({ x, y: floor - 0.1 - (WALL_HEIGHT * i) / 11 }));
+      return;
+    }
+  }
+
+  /** Works through a drawing a few points per step, then finishes it. */
+  private draw(ink: Ink, events: EventSink<InkEvent>): void {
+    if (this.drawing.length === 0) return;
+    if (!ink.sketches.has(this.me) && !ink.begin(this.me, this.drawing[0])) {
+      this.drawing = [];
+      return;
+    }
+    // Walls go up in a blink; boulders take long enough to see coming.
+    const speed = this.drawing.length <= 12 ? 6 : DRAW_SPEED;
+    for (let i = 0; i < speed && this.drawing.length > 0; i++) ink.extend(this.me, this.drawing.shift()!);
+    if (this.drawing.length === 0) ink.finish(this.me, events);
+  }
+
+  /** Steps out from under a boulder the opponent dropped. */
+  private dodgeRock(opponent: Fighter, ink: Ink): boolean {
+    const me = this.me.man.centerOfMass();
+    for (const stroke of ink.strokes) {
+      if (stroke.kind !== 'rock' || stroke.owner !== opponent) continue;
+      const rock = stroke.body.translation();
+      const falling = stroke.body.linvel().y > 0;
+      if (!falling || rock.y > me.y || Math.abs(rock.x - me.x) > 1.2) continue;
+      if (this.rng() >= this.profile.caution + 0.2) return false;
+      const away = rock.x > me.x ? -1 : 1;
+      this.move = away;
+      this.plan = ['dashAway'];
+      this.awayDir = away;
+      return true;
+    }
+    return false;
   }
 
   /** Stays up on a platform while the eraser is on its way, instead of walking down into it. */

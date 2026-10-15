@@ -28,6 +28,11 @@ export class PhysicsWorld {
    * calling back into Rapier from there can leave the world in a broken, borrowed state.
    */
   private readonly lowestPoints = new Map<number, number>();
+  /**
+   * Lowest-point functions for moving colliders that aren't balls or capsules (drawn
+   * boulders), by collider handle. Called before each step, never inside it.
+   */
+  readonly lowestPointOf = new Map<number, () => number>();
   private readonly hooks: PhysicsHooks;
   /**
    * Unused for events, but Rapier's JS bindings only run physics hooks when a step is given
@@ -72,7 +77,9 @@ export class PhysicsWorld {
     if (this.oneWayTops.size > 0) {
       this.lowestPoints.clear();
       this.world.forEachCollider((collider) => {
-        if (!collider.parent()?.isFixed()) this.lowestPoints.set(collider.handle, lowestPoint(collider));
+        if (collider.parent()?.isFixed()) return;
+        const custom = this.lowestPointOf.get(collider.handle);
+        this.lowestPoints.set(collider.handle, custom ? custom() : lowestPoint(collider));
       });
     }
     this.world.step(this.eventQueue, this.hooks);
